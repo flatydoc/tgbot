@@ -1,6 +1,7 @@
 # Деплой на Railway: https://railway.app
-# Переменные задайте в Dashboard → Variables: BOT_TOKEN, ADMIN_IDS
-# Том для SQLite: Settings → Volumes → mount path /data, Variable DATA_DIR=/data
+# Variables: BOT_TOKEN, ADMIN_IDS, DATA_DIR=/data
+# Том: Settings → Volumes → mount path /data
+# Включите у сервиса публичный доступ (Networking / Generate Domain), иначе healthcheck может не достучаться
 
 [build]
 builder = "DOCKERFILE"

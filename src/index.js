@@ -1,24 +1,27 @@
 const http = require('http');
+
+/** Слушаем до загрузки БД/бота, чтобы Railway healthcheck не ловил 503 */
+function startHealthServer() {
+  const parsed = Number(process.env.PORT);
+  const port =
+    Number.isFinite(parsed) && parsed > 0 ? parsed : 8080;
+  http
+    .createServer((_, res) => {
+      res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+      res.end('ok');
+    })
+    .listen(port, '0.0.0.0', () => {
+      console.log(
+        `HTTP health http://0.0.0.0:${port} (PORT env=${process.env.PORT ?? 'unset → 8080'})`
+      );
+    });
+}
+startHealthServer();
+
 const { Telegraf, session } = require('telegraf');
 const { Markup } = require('telegraf');
 const config = require('./config');
 const db = require('./db');
-
-/** Render / некоторые PaaS выставляют PORT и ждут открытый HTTP-сокет */
-const portEnv = process.env.PORT;
-if (portEnv) {
-  const port = Number(portEnv);
-  if (Number.isFinite(port) && port > 0) {
-    http
-      .createServer((_, res) => {
-        res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
-        res.end('ok');
-      })
-      .listen(port, '0.0.0.0', () => {
-        console.log(`HTTP health: 0.0.0.0:${port}`);
-      });
-  }
-}
 
 const MAX_CUSTOM_ANSWER_LEN = 3500;
 const MAX_BTN_LABEL = 64;
@@ -230,17 +233,23 @@ function adminMenuKeyboard() {
   ]);
 }
 
-function questionAdminKeyboard(questionId, allowCustom) {
-  const customLabel = allowCustom ? '✏️ Свой ответ: да' : '✏️ Свой ответ: нет';
-  return Markup.inlineKeyboard([
+/** textOnlyQuestion — без фиксированных вариантов: только ответ текстом, переключатель «свой ответ» скрыт */
+function questionAdminKeyboard(questionId, allowCustom, textOnlyQuestion) {
+  const rows = [
     [
       Markup.button.callback('✏️ Текст', `admin:eqt:${questionId}`),
       Markup.button.callback('📎 Варианты', `admin:eqo:${questionId}`),
     ],
-    [Markup.button.callback(customLabel, `admin:togglecust:${questionId}`)],
-    [Markup.button.callback('🗑 Удалить', `admin:qdel:${questionId}`)],
-    [Markup.button.callback('« Назад в меню', CB_MAIN_MENU)],
-  ]);
+  ];
+  if (!textOnlyQuestion) {
+    const customLabel = allowCustom ? '✏️ Свой ответ: да' : '✏️ Свой ответ: нет';
+    rows.push([
+      Markup.button.callback(customLabel, `admin:togglecust:${questionId}`),
+    ]);
+  }
+  rows.push([Markup.button.callback('🗑 Удалить', `admin:qdel:${questionId}`)]);
+  rows.push([Markup.button.callback('« Назад в меню', CB_MAIN_MENU)]);
+  return Markup.inlineKeyboard(rows);
 }
 
 function voteKeyboard(questionId, options, allowCustom) {
@@ -281,9 +290,15 @@ async function sendAdminQuestionList(ctx, banner = null) {
   for (const q of questions) {
     const preview =
       q.text.length > 300 ? `${q.text.slice(0, 297)}…` : q.text;
+    const textOnly = db.getOptions(q.id).length === 0;
+    const body = textOnly ? `${preview}\n\n📝 Только свой текст` : preview;
     const card = await ctx.reply(
-      preview,
-      questionAdminKeyboard(q.id, Boolean(Number(q.allow_custom_answer)))
+      body,
+      questionAdminKeyboard(
+        q.id,
+        Boolean(Number(q.allow_custom_answer)),
+        textOnly
+      )
     );
     ids.push(card.message_id);
   }
@@ -296,7 +311,10 @@ function buildSurveyQueue() {
   return db
     .listSurveyQuestionsAsc()
     .map((q) => q.id)
-    .filter((id) => db.getOptions(id).length >= 2);
+    .filter((id) => {
+      const n = db.getOptions(id).length;
+      return n >= 2 || n === 0;
+    });
 }
 
 async function sendCurrentSurveyQuestion(ctx) {
@@ -309,7 +327,33 @@ async function sendCurrentSurveyQuestion(ctx) {
     const qid = queue[idx];
     const q = db.getQuestion(qid);
     const options = db.getOptions(qid);
-    if (!q || options.length < 2) {
+    if (!q) {
+      idx += 1;
+      ctx.session.surveyIndex = idx;
+      continue;
+    }
+
+    if (options.length === 0) {
+      if (!Number(q.allow_custom_answer)) {
+        idx += 1;
+        ctx.session.surveyIndex = idx;
+        continue;
+      }
+      ctx.session.surveyIndex = idx;
+      await clearSurveyPromptMessage(ctx);
+      ctx.session.pendingFreeTextQuestionId = qid;
+      const msg = await ctx.telegram.sendMessage(
+        chatId,
+        `${q.text}\n\nНапишите ответ одним сообщением.`,
+        {
+          reply_markup: Markup.inlineKeyboard([[mainMenuButton()]]).reply_markup,
+        }
+      );
+      ctx.session.surveyQuestionMessageId = msg.message_id;
+      return;
+    }
+
+    if (options.length === 1) {
       idx += 1;
       ctx.session.surveyIndex = idx;
       continue;
@@ -601,6 +645,15 @@ bot.action(/^admin:togglecust:(\d+)$/, async (ctx) => {
     return;
   }
 
+  const textOnly = db.getOptions(qid).length === 0;
+  if (textOnly) {
+    await ctx.answerCbQuery({
+      text: 'Без вариантов ответ только текстом — выключить нельзя.',
+      show_alert: true,
+    });
+    return;
+  }
+
   const next = !Boolean(Number(q.allow_custom_answer));
   db.setAllowCustomAnswer(qid, next);
   const updated = db.getQuestion(qid);
@@ -616,7 +669,11 @@ bot.action(/^admin:togglecust:(\d+)$/, async (ctx) => {
       chatId,
       mid,
       undefined,
-      questionAdminKeyboard(qid, Boolean(Number(updated.allow_custom_answer))).reply_markup
+      questionAdminKeyboard(
+        qid,
+        Boolean(Number(updated.allow_custom_answer)),
+        false
+      ).reply_markup
     );
   } catch (_) {}
 });
@@ -679,7 +736,7 @@ bot.action(/^admin:eqo:(\d+)$/, async (ctx) => {
   ctx.session.flow = 'edit_q_opts';
   ctx.session.flowQuestionId = qid;
   await ctx.reply(
-    'Пришлите новые варианты ответа — каждый с новой строки (минимум 2).\n\nПосле сохранения ответы пользователей по этому вопросу будут сброшены.\n\nОтмена: /cancel'
+    'Новые варианты — каждый с новой строки (минимум 2).\n\nЧтобы убрать все варианты и оставить только свой текст участника, отправьте одну строку: `-` или «нет».\n\nПосле сохранения ответы по вопросу будут сброшены.\n\nОтмена: /cancel'
   );
 });
 
@@ -832,7 +889,7 @@ bot.on('text', async (ctx, next) => {
     ctx.session.createDraft.text = text;
     ctx.session.flow = 'create_q_opts';
     await ctx.reply(
-      'Теперь пришлите варианты ответов — каждый с новой строки (минимум 2).\n\nОтмена: /cancel'
+      'Варианты ответов — каждый с новой строки (минимум 2).\n\nЕсли вариантов быть не должно (только свой текст участника), отправьте одну строку: `-` или «нет».\n\nОтмена: /cancel'
     );
     return;
   }
@@ -840,14 +897,28 @@ bot.on('text', async (ctx, next) => {
   if (flow === 'create_q_opts') {
     const qtext = ctx.session.createDraft.text;
     const opts = parseOptionLines(text);
+    const textOnlyInput =
+      opts.length === 1 &&
+      (opts[0] === '-' || opts[0].toLowerCase() === 'нет');
+
+    if (textOnlyInput) {
+      const id = db.createQuestion(qtext, [], true);
+      clearFlow(ctx);
+      ctx.session.createDraft = {};
+      await replyAdminPanelSingleton(ctx, `Вопрос #${id} создан (только ответ текстом).`);
+      return;
+    }
+
     if (opts.length < 2) {
-      await ctx.reply('Нужно минимум два непустых варианта (каждый с новой строки). Попробуйте ещё раз.');
+      await ctx.reply(
+        'Нужно минимум два варианта (каждый с новой строки) или одна строка `-` / «нет» для вопроса только со своим текстом.\n\nОтмена: /cancel'
+      );
       return;
     }
     ctx.session.createDraft.options = opts;
     ctx.session.flow = null;
     await ctx.reply(
-      'Разрешить пользователям вводить свой ответ?',
+      'Разрешить пользователям вводить свой ответ помимо кнопок?',
       Markup.inlineKeyboard([
         [
           Markup.button.callback('Да', 'admin:cust:1'),
@@ -870,8 +941,24 @@ bot.on('text', async (ctx, next) => {
   if (flow === 'edit_q_opts') {
     const qid = ctx.session.flowQuestionId;
     const opts = parseOptionLines(text);
+    const textOnlyInput =
+      opts.length === 1 &&
+      (opts[0] === '-' || opts[0].toLowerCase() === 'нет');
+
+    if (textOnlyInput) {
+      db.replaceQuestionOptions(qid, []);
+      clearFlow(ctx);
+      await sendAdminQuestionList(
+        ctx,
+        'Варианты убраны: только ответ текстом (отключить нельзя). Сохранённые ответы пользователей удалены.'
+      );
+      return;
+    }
+
     if (opts.length < 2) {
-      await ctx.reply('Нужно минимум два варианта. Попробуйте ещё раз.');
+      await ctx.reply(
+        'Нужно минимум два варианта или одна строка `-` / «нет» для режима только своего текста. Попробуйте ещё раз.'
+      );
       return;
     }
     db.replaceQuestionOptions(qid, opts);
@@ -891,9 +978,15 @@ bot.catch((err, ctx) => {
   if (ctx?.reply) ctx.reply('Произошла ошибка. Попробуйте /start').catch(() => {});
 });
 
-bot.launch().then(() => {
-  console.log('Бот запущен');
-});
+bot
+  .launch()
+  .then(() => {
+    console.log('Бот запущен');
+  })
+  .catch((err) => {
+    console.error('Не удалось запустить Telegram-бота (проверьте BOT_TOKEN):', err);
+    process.exit(1);
+  });
 
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));

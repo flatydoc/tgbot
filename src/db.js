@@ -137,6 +137,16 @@ function migrateSurveyRevisionSchema() {
 
 migrateSurveyRevisionSchema();
 
+/** У вопросов без вариантов всегда включаем свой текст */
+function migrateTextOnlyQuestionsForceCustom() {
+  db.exec(`
+    UPDATE questions SET allow_custom_answer = 1
+    WHERE id NOT IN (SELECT DISTINCT question_id FROM question_options)
+  `);
+}
+
+migrateTextOnlyQuestionsForceCustom();
+
 function getSurveyRevision() {
   const row = db.prepare('SELECT revision FROM survey_state WHERE id = 1').get();
   return row?.revision ?? 0;
@@ -183,7 +193,9 @@ function getOptions(questionId) {
 }
 
 function createQuestion(text, optionTexts, allowCustomAnswer) {
-  const allow = allowCustomAnswer ? 1 : 0;
+  const texts = Array.isArray(optionTexts) ? optionTexts : [];
+  const textOnly = texts.length === 0;
+  const allow = textOnly ? 1 : allowCustomAnswer ? 1 : 0;
   const insertQ = db.prepare(
     'INSERT INTO questions (text, allow_custom_answer) VALUES (?, ?)'
   );
@@ -194,7 +206,7 @@ function createQuestion(text, optionTexts, allowCustomAnswer) {
   const tx = db.transaction(() => {
     const info = insertQ.run(text, allow);
     const qid = info.lastInsertRowid;
-    optionTexts.forEach((t, i) => insertO.run(qid, t.trim(), i));
+    texts.forEach((t, i) => insertO.run(qid, t.trim(), i));
     return Number(qid);
   });
 
@@ -209,8 +221,15 @@ function updateQuestionText(questionId, text) {
 }
 
 function setAllowCustomAnswer(questionId, allowed) {
+  const row = db
+    .prepare(
+      'SELECT COUNT(*) AS n FROM question_options WHERE question_id = ?'
+    )
+    .get(questionId);
+  const noOptions = Number(row?.n) === 0;
+  const val = noOptions ? 1 : allowed ? 1 : 0;
   db.prepare('UPDATE questions SET allow_custom_answer = ? WHERE id = ?').run(
-    allowed ? 1 : 0,
+    val,
     questionId
   );
   bumpSurveyRevision();
@@ -229,6 +248,11 @@ function replaceQuestionOptions(questionId, optionTexts) {
     optionTexts.forEach((t, i) => ins.run(questionId, t.trim(), i));
   });
   tx();
+  if (optionTexts.length === 0) {
+    db.prepare('UPDATE questions SET allow_custom_answer = 1 WHERE id = ?').run(
+      questionId
+    );
+  }
   bumpSurveyRevision();
 }
 
