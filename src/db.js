@@ -332,6 +332,67 @@ function listResponsesForQuestion(questionId) {
     .all(questionId);
 }
 
+function countDistinctRespondents() {
+  const row = db.prepare(`SELECT COUNT(DISTINCT user_id) AS c FROM responses`).get();
+  return Number(row?.c ?? 0);
+}
+
+/** Участники с временем последнего ответа; сортировка новые сверху */
+function listRespondentSummariesPaged(page, pageSize) {
+  const offset = page * pageSize;
+  return db
+    .prepare(
+      `
+      SELECT
+        r.user_id AS user_id,
+        MAX(r.answered_at) AS last_at,
+        (SELECT r2.username FROM responses r2 WHERE r2.user_id = r.user_id ORDER BY r2.answered_at DESC LIMIT 1) AS username,
+        (SELECT r2.first_name FROM responses r2 WHERE r2.user_id = r.user_id ORDER BY r2.answered_at DESC LIMIT 1) AS first_name,
+        (SELECT r2.last_name FROM responses r2 WHERE r2.user_id = r.user_id ORDER BY r2.answered_at DESC LIMIT 1) AS last_name
+      FROM responses r
+      GROUP BY r.user_id
+      ORDER BY last_at DESC
+      LIMIT ? OFFSET ?
+      `
+    )
+    .all(pageSize, offset);
+}
+
+/** Все ответы пользователя по вопросам */
+function listResponsesForUser(userId) {
+  return db
+    .prepare(
+      `
+      SELECT r.question_id,
+             q.text AS question_text,
+             r.answered_at,
+             o.text AS option_text,
+             r.custom_text AS custom_text
+      FROM responses r
+      JOIN questions q ON q.id = r.question_id
+      LEFT JOIN question_options o ON o.id = r.option_id
+      WHERE r.user_id = ?
+      ORDER BY q.id ASC
+      `
+    )
+    .all(userId);
+}
+
+/** Профиль для заголовка (последняя запись ответа) */
+function getRespondentProfile(userId) {
+  return db
+    .prepare(
+      `
+      SELECT username, first_name, last_name, answered_at
+      FROM responses
+      WHERE user_id = ?
+      ORDER BY answered_at DESC
+      LIMIT 1
+      `
+    )
+    .get(userId);
+}
+
 function hasCompletedSurvey(userId) {
   const rev = getSurveyRevision();
   const row = db
@@ -367,6 +428,10 @@ module.exports = {
   upsertResponseChoice,
   upsertResponseCustom,
   listResponsesForQuestion,
+  countDistinctRespondents,
+  listRespondentSummariesPaged,
+  listResponsesForUser,
+  getRespondentProfile,
   hasCompletedSurvey,
   markSurveyCompleted,
 };

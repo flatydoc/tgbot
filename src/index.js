@@ -37,6 +37,95 @@ function safePositiveInt(raw) {
   return n;
 }
 
+/** Целое ≥ 0 (например номер страницы) */
+function safeUint(raw, max = 1_000_000) {
+  const n = Number(raw);
+  if (!Number.isFinite(n) || !Number.isInteger(n) || n < 0 || n > max) return null;
+  return n;
+}
+
+const RESPONDENTS_PAGE_SIZE = 10;
+
+function respondentButtonLabel(row) {
+  const bits = [];
+  if (row.username) bits.push(`@${row.username}`);
+  const name = [row.first_name, row.last_name].filter(Boolean).join(' ').trim();
+  if (name) bits.push(name);
+  bits.push(`id ${row.user_id}`);
+  const head = bits.join(' · ');
+  const suffix = row.last_at ? ` · ${row.last_at}` : '';
+  return truncateBtn(head + suffix, MAX_BTN_LABEL);
+}
+
+function respondentsPageKeyboard(summaries, page, totalPages) {
+  const rows = summaries.map((r) => [
+    Markup.button.callback(
+      respondentButtonLabel(r),
+      `admin:rsuser:${r.user_id}`
+    ),
+  ]);
+  const navRow = [];
+  if (page > 0) navRow.push(Markup.button.callback('«', `admin:rspage:${page - 1}`));
+  navRow.push(Markup.button.callback(`${page + 1}/${totalPages}`, 'admin:rsnoop'));
+  if (page < totalPages - 1) {
+    navRow.push(Markup.button.callback('»', `admin:rspage:${page + 1}`));
+  }
+  rows.push(navRow);
+  rows.push([mainMenuButton()]);
+  return Markup.inlineKeyboard(rows);
+}
+
+async function renderRespondentsPage(ctx, requestedPage) {
+  const total = db.countDistinctRespondents();
+  const emptyKb = Markup.inlineKeyboard([[mainMenuButton()]]);
+  const emptyText = 'Пока никто не ответил ни на один вопрос.';
+
+  if (total === 0) {
+    const chatId = ctx.session.statsListChatId;
+    const mid = ctx.session.statsListMessageId;
+    if (chatId != null && mid != null) {
+      try {
+        await ctx.telegram.editMessageText(chatId, mid, undefined, emptyText, {
+          reply_markup: emptyKb.reply_markup,
+        });
+        return;
+      } catch (_) {}
+    }
+    const msg = await ctx.reply(emptyText, emptyKb);
+    ctx.session.statsListMessageId = msg.message_id;
+    ctx.session.statsListChatId = msg.chat.id;
+    ctx.session.menuMessageId = msg.message_id;
+    return;
+  }
+
+  const totalPages = Math.max(1, Math.ceil(total / RESPONDENTS_PAGE_SIZE));
+  let page = safeUint(requestedPage, Math.max(totalPages, 1) + 1000) ?? 0;
+  if (page > totalPages - 1) page = totalPages - 1;
+
+  ctx.session.statsUserListPage = page;
+
+  const summaries = db.listRespondentSummariesPaged(page, RESPONDENTS_PAGE_SIZE);
+  const text = `Ответившие участники (новые сверху по дате последнего ответа).\nСтраница ${page + 1} из ${totalPages}:`;
+  const kb = respondentsPageKeyboard(summaries, page, totalPages);
+
+  const chatId = ctx.session.statsListChatId;
+  const mid = ctx.session.statsListMessageId;
+
+  if (chatId != null && mid != null) {
+    try {
+      await ctx.telegram.editMessageText(chatId, mid, undefined, text, {
+        reply_markup: kb.reply_markup,
+      });
+      return;
+    } catch (_) {}
+  }
+
+  const msg = await ctx.reply(text, kb);
+  ctx.session.statsListMessageId = msg.message_id;
+  ctx.session.statsListChatId = msg.chat.id;
+  ctx.session.menuMessageId = msg.message_id;
+}
+
 function truncateBtn(s, maxLen = MAX_BTN_LABEL) {
   const t = String(s).trim();
   if (t.length <= maxLen) return t;
@@ -177,6 +266,8 @@ async function presentHome(ctx, caption) {
   await clearSurveyPromptMessage(ctx);
   clearSurvey(ctx);
   await clearSingletonMenuMessage(ctx);
+  ctx.session.statsListMessageId = null;
+  ctx.session.statsListChatId = null;
 
   const id = ctx.from.id;
   let text = caption;
@@ -459,6 +550,9 @@ bot.use(
       surveySummaryBody: null,
       adminListMessageIds: [],
       statsReportMessageIds: [],
+      statsListMessageId: null,
+      statsListChatId: null,
+      statsUserListPage: 0,
     }),
   })
 );
@@ -559,68 +653,78 @@ bot.action('admin:stats', async (ctx) => {
   await clearAdminListMessages(ctx);
   await clearStatsReportMessages(ctx);
 
-  const questions = db.listQuestionsDesc();
-  if (questions.length === 0) {
-    await replyAdminPanelSingleton(ctx, 'Нет вопросов.');
-    return;
-  }
+  ctx.session.statsListMessageId = null;
+  ctx.session.statsListChatId = null;
 
-  const rows = questions.map((q) => [
-    Markup.button.callback(truncateBtn(q.text), `admin:statq:${q.id}`),
-  ]);
-  rows.push([mainMenuButton()]);
-  const msg = await ctx.reply(
-    'Выберите вопрос, чтобы увидеть ответы пользователей:',
-    Markup.inlineKeyboard(rows)
-  );
-  ctx.session.menuMessageId = msg.message_id;
+  await renderRespondentsPage(ctx, 0);
 });
 
-bot.action(/^admin:statq:(\d+)$/, async (ctx) => {
+bot.action(/^admin:rspage:(\d+)$/, async (ctx) => {
   await ctx.answerCbQuery();
   if (!config.isAdmin(ctx.from.id)) return;
 
-  const qid = safePositiveInt(ctx.match[1]);
-  if (qid == null) return;
+  const p = safeUint(ctx.match[1]);
+  if (p == null) return;
 
-  const q = db.getQuestion(qid);
-  if (!q) {
-    await ctx.reply('Вопрос не найден.');
+  await renderRespondentsPage(ctx, p);
+});
+
+bot.action('admin:rsnoop', async (ctx) => {
+  await ctx.answerCbQuery();
+});
+
+bot.action(/^admin:rsuser:(\d+)$/, async (ctx) => {
+  await ctx.answerCbQuery();
+  if (!config.isAdmin(ctx.from.id)) return;
+
+  const uid = Number(ctx.match[1]);
+  if (!Number.isFinite(uid) || !Number.isInteger(uid) || uid <= 0) return;
+
+  const page = ctx.session.statsUserListPage ?? 0;
+
+  const rows = db.listResponsesForUser(uid);
+  if (rows.length === 0) {
+    await ctx.reply('У этого пользователя нет сохранённых ответов.');
     return;
   }
 
-  await clearSingletonMenuMessage(ctx);
-  await clearStatsReportMessages(ctx);
+  const profile = db.getRespondentProfile(uid);
 
-  const list = db.listResponsesForQuestion(qid);
-  const header = `Вопрос:\n${q.text}\n\nОтветило человек: ${list.length}\n`;
+  const headerLines = ['Ответы пользователя:'];
+  headerLines.push(`id ${uid}`);
+  if (profile?.username) headerLines.push(`@${profile.username}`);
+  const nm = [profile?.first_name, profile?.last_name].filter(Boolean).join(' ').trim();
+  if (nm) headerLines.push(nm);
+  if (profile?.answered_at) headerLines.push(`Последний ответ: ${profile.answered_at}`);
+  headerLines.push('');
 
-  if (list.length === 0) {
-    const msg = await ctx.reply(`${header}\nПока никто не ответил.`, adminMenuKeyboard());
-    ctx.session.menuMessageId = msg.message_id;
-    ctx.session.statsReportMessageIds = [];
-    return;
-  }
+  const blocks = rows.map((r) => {
+    const ans = r.custom_text || r.option_text || '—';
+    return `${r.question_text}\n→ ${ans}\n(${r.answered_at})`;
+  });
 
+  let buf = headerLines.join('\n');
   const chunks = [];
-  let buf = header;
-  for (const r of list) {
-    const line = `${participantLine(r)}\n\n`;
-    if (buf.length + line.length > 3500) {
-      chunks.push(buf);
-      buf = line;
+  for (const b of blocks) {
+    const piece = `\n\n${b}`;
+    if (buf.length + piece.length > 3500) {
+      chunks.push(buf.trimEnd());
+      buf = b;
     } else {
-      buf += line;
+      buf += piece;
     }
   }
-  chunks.push(buf);
+  chunks.push(buf.trimEnd());
+
+  const backKb = Markup.inlineKeyboard([
+    [Markup.button.callback('« К списку участников', `admin:rspage:${page}`)],
+    [mainMenuButton()],
+  ]);
 
   const reportIds = [];
   for (let i = 0; i < chunks.length; i++) {
-    const msg = await ctx.reply(
-      chunks[i],
-      i === chunks.length - 1 ? adminMenuKeyboard() : undefined
-    );
+    const last = i === chunks.length - 1;
+    const msg = await ctx.reply(chunks[i], last ? backKb : undefined);
     reportIds.push(msg.message_id);
   }
   ctx.session.statsReportMessageIds = reportIds;
